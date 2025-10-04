@@ -1,0 +1,186 @@
+import argparse
+import io
+from collections import Counter
+from datetime import date
+from pathlib import Path
+
+from PIL import Image
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+
+def click_cookie_accept(page):
+    try:
+        page.locator("#cookie-consent-accept").click(timeout=1500)
+    except Exception:
+        pass
+
+
+JS_ZBOOST = """
+(sel) => {
+  const el = document.querySelector(sel); if (!el) return false;
+  el.style.position = 'relative'; el.style.zIndex = '2147483647';
+  let p = el.parentElement;
+  while (p && p !== document.body) {
+    const cs = getComputedStyle(p);
+    if (cs.overflow !== 'visible') p.style.overflow = 'visible';
+    if (cs.position === 'static') p.style.position = 'relative';
+    p.style.zIndex = (parseInt(p.style.zIndex || '0', 10) + 1).toString();
+    p = p.parentElement;
+  }
+  return true;
+}
+"""
+
+JS_HIDE_KEYBOARD = """
+() => {
+  const letters = new Set("QWERTYUIOPÅASDFGHJKLØÆZXCVBNM");
+  const buttons = Array.from(document.querySelectorAll('button'));
+  const buckets = new Map();
+  for (const b of buttons) {
+    const t = (b.textContent || "").trim().toUpperCase();
+    if (t.length === 1 && letters.has(t)) {
+      const cont = b.closest('[class], [role], div, section, footer, header') || b.parentElement;
+      if (cont) buckets.set(cont, (buckets.get(cont) || 0) + 1);
+    }
+  }
+  let kb = null, max = 0;
+  for (const [el, cnt] of buckets.entries()) if (cnt >= 10 && cnt > max) { kb = el; max = cnt; }
+  if (kb) kb.style.display = 'none';
+  const style = document.createElement('style');
+  style.textContent = `
+    .keyboard, [class*="keyboard" i], [aria-label*="keyboard" i],
+    [aria-label*="tastatur" i], [data-testid*="keyboard" i],
+    .virtual-keyboard, [class*="virtual-keyboard" i],
+    .bottom-bar, [class*="bottom-bar" i] { display:none!important; visibility:hidden!important; opacity:0!important; height:0!important; }
+  `;
+  document.head.appendChild(style);
+}
+"""
+
+
+def most_common_corner_color(img: Image.Image):
+    w, h = img.size
+    pts = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+    colors = [img.getpixel(p) for p in pts]
+    colors = [c[:3] if isinstance(c, tuple) and len(c) == 4 else c for c in colors]
+    return Counter(colors).most_common(1)[0][0]
+
+
+def trim_uniform_bg(img: Image.Image, tol=12, pad=10) -> Image.Image:
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    bg = most_common_corner_color(img)
+    import numpy as np
+    arr = np.asarray(img, dtype=np.int16)
+    bg_arr = np.array(bg, dtype=np.int16).reshape(1, 1, 3)
+    diff = np.max(np.abs(arr - bg_arr), axis=2)
+    mask = diff > tol
+    if not mask.any():
+        return img
+    ys, xs = np.where(mask)
+    l, r, t, b = xs.min(), xs.max(), ys.min(), ys.max()
+    l = max(0, l - pad)
+    t = max(0, t - pad)
+    r = min(img.width - 1, r + pad)
+    b = min(img.height - 1, b + pad)
+    return img.crop((l, t, r + 1, b + 1))
+
+
+def save_pdf(rgb_img: Image.Image, out_base: str):
+    import img2pdf
+    buf = io.BytesIO()
+    rgb_img.save(buf, format="PNG")
+    pdf_path = Path(out_base).with_suffix(".pdf")
+    with open(pdf_path, "wb") as f:
+        f.write(img2pdf.convert(buf.getvalue()))
+    return pdf_path
+
+
+def click_eye_and_reveal(frame) -> bool:
+    try:
+        eye = frame.locator('button[data-tooltip-content="Vis"]').first
+        eye.click(timeout=1500)
+    except Exception:
+        print("Could not click eye button")
+        return False
+
+    try:
+        frame.locator('text=/Vis hele løsningen/i').click(timeout=2000)
+        return True
+    except Exception:
+        print("Could not click 'Vis hele løsningen'")
+        return False
+
+
+def download_crossword():
+    ap = argparse.ArgumentParser(description="Save crossword + solution as trimmed PDFs with date-based filenames.")
+    ap.add_argument("--url", default="https://kryssord.no/oppgaver/kryssord-2")
+    ap.add_argument("--selector", default='[class*="-crosswordType-"]',
+                    help="Grid container selector inside the iframe.")
+    ap.add_argument("--trim-tol", type=int, default=12)
+    ap.add_argument("--pad", type=int, default=10)
+    args = ap.parse_args()
+
+    today = date.today().strftime("%Y-%m-%d")
+    base_name = f"{today}-kryssord"
+    sol_name = f"{today}-kryssord-løsning"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(viewport={"width": 1600, "height": 1200}, device_scale_factor=2)
+        page = ctx.new_page()
+
+        try:
+            page.goto(args.url, timeout=30000)
+        except PWTimeout:
+            raise SystemExit("Page load timed out.")
+
+        click_cookie_accept(page)
+
+        frame = page.frame(name="crossword")
+        if not frame:
+            for f in page.frames:
+                if "egmont-crosswords-frontend" in (f.url or ""):
+                    frame = f
+                    break
+        if not frame:
+            raise SystemExit("Crossword iframe not found.")
+
+        try:
+            frame.wait_for_selector(args.selector, timeout=12000)
+        except PWTimeout:
+            raise SystemExit(f"Grid element not found with selector: {args.selector}")
+
+        try:
+            frame.evaluate(JS_HIDE_KEYBOARD)
+        except Exception:
+            pass
+        frame.evaluate(JS_ZBOOST, args.selector)
+        grid = frame.locator(args.selector).first
+        grid.scroll_into_view_if_needed(timeout=1500)
+
+        png = grid.screenshot()
+        base_img = Image.open(io.BytesIO(png)).convert("RGB")
+        base_trim = trim_uniform_bg(base_img, tol=args.trim_tol, pad=args.pad)
+        base_pdf = save_pdf(base_trim, base_name)
+
+        revealed = click_eye_and_reveal(frame)
+        page.wait_for_timeout(800)
+        sol_pdf = None
+        if revealed:
+            try:
+                frame.evaluate(JS_HIDE_KEYBOARD)
+            except Exception:
+                pass
+            frame.evaluate(JS_ZBOOST, args.selector)
+            png2 = grid.screenshot()
+            sol_img = Image.open(io.BytesIO(png2)).convert("RGB")
+            sol_trim = trim_uniform_bg(sol_img, tol=args.trim_tol, pad=args.pad)
+            sol_pdf = save_pdf(sol_trim, sol_name)
+
+        browser.close()
+
+    msg = f"Saved: {base_pdf}"
+    if sol_pdf:
+        msg += f", {sol_pdf}"
+    print(msg)
