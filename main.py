@@ -1,7 +1,8 @@
-import argparse, io, re
+import argparse, io
 from pathlib import Path
 from collections import Counter
 from PIL import Image
+from datetime import date
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # --- helpers ---------------------------------------------------------------
@@ -84,11 +85,7 @@ def save_pdf(rgb_img: Image.Image, out_base: str):
 # --- reveal via the “Vis” eye menu ----------------------------------------
 
 def click_eye_and_reveal(frame) -> bool:
-    """
-    Open the eye (“Vis”) menu and click “Vis hele løsningen”.
-    """
-
-    # Directly target the button by its tooltip attribute
+    """Open the eye (“Vis”) menu and click “Vis hele løsningen”."""
     try:
         eye = frame.locator('button[data-tooltip-content="Vis"]').first
         eye.click(timeout=1500)
@@ -96,7 +93,6 @@ def click_eye_and_reveal(frame) -> bool:
         print("Could not click eye button")
         return False
 
-    # Then click the “Vis hele løsningen” item
     try:
         frame.locator('text=/Vis hele løsningen/i').click(timeout=2000)
         return True
@@ -108,14 +104,17 @@ def click_eye_and_reveal(frame) -> bool:
 # --- main ------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Save crossword + solution as trimmed PDFs (using 'Vis' eye menu).")
+    ap = argparse.ArgumentParser(description="Save crossword + solution as trimmed PDFs with date-based filenames.")
     ap.add_argument("--url", default="https://kryssord.no/oppgaver/kryssord-2")
-    ap.add_argument("--out", default="crossword")
     ap.add_argument("--selector", default='[class*="-crosswordType-"]',
                     help="Grid container selector inside the iframe.")
     ap.add_argument("--trim-tol", type=int, default=12)
     ap.add_argument("--pad", type=int, default=10)
     args = ap.parse_args()
+
+    today = date.today().strftime("%Y-%m-%d")
+    base_name = f"{today}-kryssord"
+    sol_name = f"{today}-kryssord-løsning"
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -129,49 +128,42 @@ def main():
 
         click_cookie_accept(page)
 
-        # iframe
         frame = page.frame(name="crossword")
         if not frame:
             for f in page.frames:
-                if "egmont-crosswords-frontend" in (f.url or ""): frame = f; break
+                if "egmont-crosswords-frontend" in (f.url or ""):
+                    frame = f; break
         if not frame: raise SystemExit("Crossword iframe not found.")
 
-        # grid present
         try:
             frame.wait_for_selector(args.selector, timeout=12000)
         except PWTimeout:
             raise SystemExit(f"Grid element not found with selector: {args.selector}")
 
-        # Hide keyboard; bring grid front
         try: frame.evaluate(JS_HIDE_KEYBOARD)
         except Exception: pass
         frame.evaluate(JS_ZBOOST, args.selector)
         grid = frame.locator(args.selector).first
         grid.scroll_into_view_if_needed(timeout=1500)
 
-        # --- 1) base puzzle ---
+        # --- Base puzzle ---
         png = grid.screenshot()
         base_img = Image.open(io.BytesIO(png)).convert("RGB")
         base_trim = trim_uniform_bg(base_img, tol=args.trim_tol, pad=args.pad)
-        base_pdf = save_pdf(base_trim, args.out)
+        base_pdf = save_pdf(base_trim, base_name)
 
-        # --- 2) open “Vis” eye and click “Vis hele løsningen” ---
+        # --- Solution ---
         revealed = click_eye_and_reveal(frame)
-        page.wait_for_timeout(800)  # let DOM update
-
+        page.wait_for_timeout(800)
         sol_pdf = None
         if revealed:
-            # re-apply safety tweaks in case of re-render
             try: frame.evaluate(JS_HIDE_KEYBOARD)
             except Exception: pass
             frame.evaluate(JS_ZBOOST, args.selector)
             png2 = grid.screenshot()
             sol_img = Image.open(io.BytesIO(png2)).convert("RGB")
             sol_trim = trim_uniform_bg(sol_img, tol=args.trim_tol, pad=args.pad)
-            sol_pdf = save_pdf(sol_trim, f"{args.out}-solution")
-        else:
-            print("Warning: couldn’t click the solution item via the eye menu. "
-                  "If the label differs, adjust the regexes in click_eye_and_reveal().")
+            sol_pdf = save_pdf(sol_trim, sol_name)
 
         browser.close()
 
