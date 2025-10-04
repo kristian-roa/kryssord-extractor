@@ -1,25 +1,19 @@
-import argparse
-import io
+import argparse, io, re
 from pathlib import Path
 from collections import Counter
-
-from PIL import Image, ImageStat
+from PIL import Image
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
+# --- helpers ---------------------------------------------------------------
 
 def click_cookie_accept(page):
-    try:
-        page.locator("#cookie-consent-accept").click(timeout=1500)
-    except Exception:
-        pass
-
+    try: page.locator("#cookie-consent-accept").click(timeout=1500)
+    except Exception: pass
 
 JS_ZBOOST = """
 (sel) => {
-  const el = document.querySelector(sel);
-  if (!el) return false;
-  el.style.position = 'relative';
-  el.style.zIndex = '2147483647';
+  const el = document.querySelector(sel); if (!el) return false;
+  el.style.position = 'relative'; el.style.zIndex = '2147483647';
   let p = el.parentElement;
   while (p && p !== document.body) {
     const cs = getComputedStyle(p);
@@ -47,7 +41,6 @@ JS_HIDE_KEYBOARD = """
   let kb = null, max = 0;
   for (const [el, cnt] of buckets.entries()) if (cnt >= 10 && cnt > max) { kb = el; max = cnt; }
   if (kb) kb.style.display = 'none';
-
   const style = document.createElement('style');
   style.textContent = `
     .keyboard, [class*="keyboard" i], [aria-label*="keyboard" i],
@@ -59,88 +52,74 @@ JS_HIDE_KEYBOARD = """
 }
 """
 
-
 def most_common_corner_color(img: Image.Image):
-    """Return the most common color among the 4 corners (handles off-white backgrounds)."""
-    w, h = img.size
-    pts = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+    w,h = img.size
+    pts = [(0,0),(w-1,0),(0,h-1),(w-1,h-1)]
     colors = [img.getpixel(p) for p in pts]
-    # If image has alpha (shouldn't), drop it
-    colors = [c[:3] if isinstance(c, tuple) and len(c) == 4 else c for c in colors]
+    colors = [c[:3] if isinstance(c, tuple) and len(c)==4 else c for c in colors]
     return Counter(colors).most_common(1)[0][0]
 
-
-def trim_uniform_bg(img: Image.Image, bg=None, tol=10, pad=8) -> Image.Image:
-    """
-    Trim uniform background (near `bg`) with tolerance.
-    - bg: (R,G,B) background color; if None, inferred from corners.
-    - tol: 0..255, higher → more aggressive trimming.
-    - pad: pixels of margin kept after trimming.
-    """
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-
-    if bg is None:
-        bg = most_common_corner_color(img)
-
-    # Build a mask of "content" pixels: any pixel sufficiently different from bg
-    # Difference metric: max per-channel absolute difference
+def trim_uniform_bg(img: Image.Image, tol=12, pad=10) -> Image.Image:
+    if img.mode != "RGB": img = img.convert("RGB")
+    bg = most_common_corner_color(img)
     import numpy as np
     arr = np.asarray(img, dtype=np.int16)
-    bg_arr = np.array(bg, dtype=np.int16).reshape(1, 1, 3)
+    bg_arr = np.array(bg, dtype=np.int16).reshape(1,1,3)
     diff = np.max(np.abs(arr - bg_arr), axis=2)
     mask = diff > tol
-
-    # If the mask is empty (extreme case), return original
-    if not mask.any():
-        return img
-
+    if not mask.any(): return img
     ys, xs = np.where(mask)
-    left, right = xs.min(), xs.max()
-    top, bottom = ys.min(), ys.max()
+    l, r, t, b = xs.min(), xs.max(), ys.min(), ys.max()
+    l = max(0, l-pad); t = max(0, t-pad)
+    r = min(img.width-1, r+pad); b = min(img.height-1, b+pad)
+    return img.crop((l, t, r+1, b+1))
 
-    # Apply padding and clamp
-    left = max(0, left - pad)
-    top = max(0, top - pad)
-    right = min(img.width - 1, right + pad)
-    bottom = min(img.height - 1, bottom + pad)
+def save_pdf(rgb_img: Image.Image, out_base: str):
+    import img2pdf
+    buf = io.BytesIO(); rgb_img.save(buf, format="PNG")  # ensure opaque
+    pdf_path = Path(out_base).with_suffix(".pdf")
+    with open(pdf_path, "wb") as f: f.write(img2pdf.convert(buf.getvalue()))
+    return pdf_path
 
-    return img.crop((left, top, right + 1, bottom + 1))
+# --- reveal via the “Vis” eye menu ----------------------------------------
+
+def click_eye_and_reveal(frame) -> bool:
+    """
+    Open the eye (“Vis”) menu and click “Vis hele løsningen”.
+    """
+
+    # Directly target the button by its tooltip attribute
+    try:
+        eye = frame.locator('button[data-tooltip-content="Vis"]').first
+        eye.click(timeout=1500)
+    except Exception:
+        print("Could not click eye button")
+        return False
+
+    # Then click the “Vis hele løsningen” item
+    try:
+        frame.locator('text=/Vis hele løsningen/i').click(timeout=2000)
+        return True
+    except Exception:
+        print("Could not click 'Vis hele løsningen'")
+        return False
 
 
-def save_outputs(rgb_img: Image.Image, out_base: str, fmt: str):
-    outputs = []
-    if fmt in ("jpg", "both"):
-        jp = Path(out_base).with_suffix(".jpg")
-        rgb_img.save(jp, "JPEG", quality=92)
-        outputs.append(jp)
-    if fmt in ("pdf", "both"):
-        import img2pdf, io
-        buf = io.BytesIO()
-        rgb_img.save(buf, format="PNG")
-        pp = Path(out_base).with_suffix(".pdf")
-        with open(pp, "wb") as f:
-            f.write(img2pdf.convert(buf.getvalue()))
-        outputs.append(pp)
-    return outputs
-
+# --- main ------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Screenshot ONLY the crossword grid and trim surrounding whitespace.")
-    parser.add_argument("--url", default="https://kryssord.no/oppgaver/kryssord-2")
-    parser.add_argument("--out", default="crossword")
-    parser.add_argument("--format", choices=["jpg", "pdf", "both"], default="pdf")
-    parser.add_argument("--selector", default='[class*="-crosswordType-"]',
-                        help="Selector for the grid container inside the iframe.")
-    parser.add_argument("--trim-tol", type=int, default=10,
-                        help="Background trim tolerance (0–255). Increase if thin margins remain.")
-    parser.add_argument("--pad", type=int, default=8,
-                        help="Padding (px) to keep around the cropped grid after trimming.")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Save crossword + solution as trimmed PDFs (using 'Vis' eye menu).")
+    ap.add_argument("--url", default="https://kryssord.no/oppgaver/kryssord-2")
+    ap.add_argument("--out", default="crossword")
+    ap.add_argument("--selector", default='[class*="-crosswordType-"]',
+                    help="Grid container selector inside the iframe.")
+    ap.add_argument("--trim-tol", type=int, default=12)
+    ap.add_argument("--pad", type=int, default=10)
+    args = ap.parse_args()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(viewport={"width": 1600, "height": 1200}, device_scale_factor=2)
+        ctx = browser.new_context(viewport={"width":1600,"height":1200}, device_scale_factor=2)
         page = ctx.new_page()
 
         try:
@@ -150,43 +129,55 @@ def main():
 
         click_cookie_accept(page)
 
-        # Access iframe
+        # iframe
         frame = page.frame(name="crossword")
         if not frame:
             for f in page.frames:
-                if "egmont-crosswords-frontend" in (f.url or ""):
-                    frame = f
-                    break
-        if not frame:
-            raise SystemExit("Crossword iframe not found.")
+                if "egmont-crosswords-frontend" in (f.url or ""): frame = f; break
+        if not frame: raise SystemExit("Crossword iframe not found.")
 
-        # Ensure the grid exists
+        # grid present
         try:
             frame.wait_for_selector(args.selector, timeout=12000)
         except PWTimeout:
             raise SystemExit(f"Grid element not found with selector: {args.selector}")
 
-        # Hide keyboard & raise the grid above everything
-        try:
-            frame.evaluate(JS_HIDE_KEYBOARD)
-        except Exception:
-            pass
+        # Hide keyboard; bring grid front
+        try: frame.evaluate(JS_HIDE_KEYBOARD)
+        except Exception: pass
         frame.evaluate(JS_ZBOOST, args.selector)
+        grid = frame.locator(args.selector).first
+        grid.scroll_into_view_if_needed(timeout=1500)
 
-        # Element-only screenshot
-        loc = frame.locator(args.selector).first
-        loc.scroll_into_view_if_needed(timeout=2000)
-        png_bytes = loc.screenshot()
+        # --- 1) base puzzle ---
+        png = grid.screenshot()
+        base_img = Image.open(io.BytesIO(png)).convert("RGB")
+        base_trim = trim_uniform_bg(base_img, tol=args.trim_tol, pad=args.pad)
+        base_pdf = save_pdf(base_trim, args.out)
+
+        # --- 2) open “Vis” eye and click “Vis hele løsningen” ---
+        revealed = click_eye_and_reveal(frame)
+        page.wait_for_timeout(800)  # let DOM update
+
+        sol_pdf = None
+        if revealed:
+            # re-apply safety tweaks in case of re-render
+            try: frame.evaluate(JS_HIDE_KEYBOARD)
+            except Exception: pass
+            frame.evaluate(JS_ZBOOST, args.selector)
+            png2 = grid.screenshot()
+            sol_img = Image.open(io.BytesIO(png2)).convert("RGB")
+            sol_trim = trim_uniform_bg(sol_img, tol=args.trim_tol, pad=args.pad)
+            sol_pdf = save_pdf(sol_trim, f"{args.out}-solution")
+        else:
+            print("Warning: couldn’t click the solution item via the eye menu. "
+                  "If the label differs, adjust the regexes in click_eye_and_reveal().")
 
         browser.close()
 
-    # Trim whitespace around the grid
-    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-    trimmed = trim_uniform_bg(img, bg=None, tol=args.trim_tol, pad=args.pad)
-
-    outs = save_outputs(trimmed, args.out, args.format)
-    print("Saved:", ", ".join(str(p) for p in outs))
-
+    msg = f"Saved: {base_pdf}"
+    if sol_pdf: msg += f", {sol_pdf}"
+    print(msg)
 
 if __name__ == "__main__":
     main()
