@@ -1,7 +1,9 @@
 import argparse
 import io
 from pathlib import Path
-from PIL import Image
+from collections import Counter
+
+from PIL import Image, ImageStat
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 
@@ -16,12 +18,8 @@ JS_ZBOOST = """
 (sel) => {
   const el = document.querySelector(sel);
   if (!el) return false;
-
-  // Bring target above everything
   el.style.position = 'relative';
   el.style.zIndex = '2147483647';
-
-  // Ensure parents don't clip it
   let p = el.parentElement;
   while (p && p !== document.body) {
     const cs = getComputedStyle(p);
@@ -36,7 +34,6 @@ JS_ZBOOST = """
 
 JS_HIDE_KEYBOARD = """
 () => {
-  // Try to detect a keyboard by many 1-letter buttons (incl. Æ Ø Å)
   const letters = new Set("QWERTYUIOPÅASDFGHJKLØÆZXCVBNM");
   const buttons = Array.from(document.querySelectorAll('button'));
   const buckets = new Map();
@@ -49,12 +46,8 @@ JS_HIDE_KEYBOARD = """
   }
   let kb = null, max = 0;
   for (const [el, cnt] of buckets.entries()) if (cnt >= 10 && cnt > max) { kb = el; max = cnt; }
-  if (kb) {
-    kb.style.display = 'none';
-    return true;
-  }
+  if (kb) kb.style.display = 'none';
 
-  // CSS catch-all
   const style = document.createElement('style');
   style.textContent = `
     .keyboard, [class*="keyboard" i], [aria-label*="keyboard" i],
@@ -63,22 +56,68 @@ JS_HIDE_KEYBOARD = """
     .bottom-bar, [class*="bottom-bar" i] { display:none!important; visibility:hidden!important; opacity:0!important; height:0!important; }
   `;
   document.head.appendChild(style);
-  return false;
 }
 """
 
-def save_outputs(png_bytes: bytes, out_base: str, fmt: str):
-    rgb = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+
+def most_common_corner_color(img: Image.Image):
+    """Return the most common color among the 4 corners (handles off-white backgrounds)."""
+    w, h = img.size
+    pts = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+    colors = [img.getpixel(p) for p in pts]
+    # If image has alpha (shouldn't), drop it
+    colors = [c[:3] if isinstance(c, tuple) and len(c) == 4 else c for c in colors]
+    return Counter(colors).most_common(1)[0][0]
+
+
+def trim_uniform_bg(img: Image.Image, bg=None, tol=10, pad=8) -> Image.Image:
+    """
+    Trim uniform background (near `bg`) with tolerance.
+    - bg: (R,G,B) background color; if None, inferred from corners.
+    - tol: 0..255, higher → more aggressive trimming.
+    - pad: pixels of margin kept after trimming.
+    """
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    if bg is None:
+        bg = most_common_corner_color(img)
+
+    # Build a mask of "content" pixels: any pixel sufficiently different from bg
+    # Difference metric: max per-channel absolute difference
+    import numpy as np
+    arr = np.asarray(img, dtype=np.int16)
+    bg_arr = np.array(bg, dtype=np.int16).reshape(1, 1, 3)
+    diff = np.max(np.abs(arr - bg_arr), axis=2)
+    mask = diff > tol
+
+    # If the mask is empty (extreme case), return original
+    if not mask.any():
+        return img
+
+    ys, xs = np.where(mask)
+    left, right = xs.min(), xs.max()
+    top, bottom = ys.min(), ys.max()
+
+    # Apply padding and clamp
+    left = max(0, left - pad)
+    top = max(0, top - pad)
+    right = min(img.width - 1, right + pad)
+    bottom = min(img.height - 1, bottom + pad)
+
+    return img.crop((left, top, right + 1, bottom + 1))
+
+
+def save_outputs(rgb_img: Image.Image, out_base: str, fmt: str):
     outputs = []
     if fmt in ("jpg", "both"):
         jp = Path(out_base).with_suffix(".jpg")
-        rgb.save(jp, "JPEG", quality=92)
+        rgb_img.save(jp, "JPEG", quality=92)
         outputs.append(jp)
     if fmt in ("pdf", "both"):
-        import img2pdf
-        # round-trip through PNG bytes to avoid transparency issues (should be none, but safe)
+        import img2pdf, io
         buf = io.BytesIO()
-        rgb.save(buf, format="PNG")
+        rgb_img.save(buf, format="PNG")
         pp = Path(out_base).with_suffix(".pdf")
         with open(pp, "wb") as f:
             f.write(img2pdf.convert(buf.getvalue()))
@@ -87,13 +126,17 @@ def save_outputs(png_bytes: bytes, out_base: str, fmt: str):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Screenshot ONLY the crossword grid (DOM element) without keyboard.")
-    ap.add_argument("--url", default="https://kryssord.no/oppgaver/kryssord-2")
-    ap.add_argument("--out", default="crossword")
-    ap.add_argument("--format", choices=["jpg", "pdf", "both"], default="both")
-    # If the site changes, you can pass your own selector for the grid element:
-    ap.add_argument("--selector", default='[class*="-crosswordType-"]')
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Screenshot ONLY the crossword grid and trim surrounding whitespace.")
+    parser.add_argument("--url", default="https://kryssord.no/oppgaver/kryssord-2")
+    parser.add_argument("--out", default="crossword")
+    parser.add_argument("--format", choices=["jpg", "pdf", "both"], default="pdf")
+    parser.add_argument("--selector", default='[class*="-crosswordType-"]',
+                        help="Selector for the grid container inside the iframe.")
+    parser.add_argument("--trim-tol", type=int, default=10,
+                        help="Background trim tolerance (0–255). Increase if thin margins remain.")
+    parser.add_argument("--pad", type=int, default=8,
+                        help="Padding (px) to keep around the cropped grid after trimming.")
+    args = parser.parse_args()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -107,7 +150,7 @@ def main():
 
         click_cookie_accept(page)
 
-        # Get the crossword iframe
+        # Access iframe
         frame = page.frame(name="crossword")
         if not frame:
             for f in page.frames:
@@ -117,32 +160,31 @@ def main():
         if not frame:
             raise SystemExit("Crossword iframe not found.")
 
-        # Wait for the grid element to exist
-        grid = frame.query_selector(args.selector)
-        if not grid:
-            try:
-                frame.wait_for_selector(args.selector, timeout=12000)
-                grid = frame.query_selector(args.selector)
-            except PWTimeout:
-                raise SystemExit(f"Grid element not found using selector: {args.selector}")
-        if not grid:
-            raise SystemExit(f"Grid element not found using selector: {args.selector}")
+        # Ensure the grid exists
+        try:
+            frame.wait_for_selector(args.selector, timeout=12000)
+        except PWTimeout:
+            raise SystemExit(f"Grid element not found with selector: {args.selector}")
 
-        # Hide keyboard and raise the grid
+        # Hide keyboard & raise the grid above everything
         try:
             frame.evaluate(JS_HIDE_KEYBOARD)
         except Exception:
             pass
         frame.evaluate(JS_ZBOOST, args.selector)
 
-        # Ensure in view and screenshot the element only
+        # Element-only screenshot
         loc = frame.locator(args.selector).first
         loc.scroll_into_view_if_needed(timeout=2000)
-        png = loc.screenshot()  # element-only screenshot inside the iframe
+        png_bytes = loc.screenshot()
 
         browser.close()
 
-    outs = save_outputs(png, args.out, args.format)
+    # Trim whitespace around the grid
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    trimmed = trim_uniform_bg(img, bg=None, tol=args.trim_tol, pad=args.pad)
+
+    outs = save_outputs(trimmed, args.out, args.format)
     print("Saved:", ", ".join(str(p) for p in outs))
 
 
