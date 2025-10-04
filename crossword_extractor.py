@@ -184,3 +184,5 @@ def download_crossword():
     if sol_pdf:
         msg += f", {sol_pdf}"
     print(msg)
+
+    return base_pdf, sol_pdf
