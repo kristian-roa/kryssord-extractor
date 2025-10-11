@@ -14,7 +14,7 @@ def download_and_upload_kryssord_no(upload):
 
 
 def download_and_upload_gratis_kryssord(upload):
-    kryssord_path = gratis_kryssord.download_gratiskryssord("https://www.gratiskryssord.no/kryssord/dagens/")
+    kryssord_path = gratis_kryssord.download_gratiskryssord(True)
     if upload: remarkable.upload_to_remarkable(kryssord_path)
 
 
