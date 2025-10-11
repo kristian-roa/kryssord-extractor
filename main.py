@@ -4,18 +4,17 @@
 import argparse
 import kryssord_no
 import gratis_kryssord
-import remarkable
 
 
 def download_and_upload_kryssord_no():
     kryssord_path, solution_path = kryssord_no.download_crossword()
-    remarkable.upload_to_remarkable(kryssord_path)
-    remarkable.upload_to_remarkable(solution_path, True)
+    # remarkable.upload_to_remarkable(kryssord_path)
+    # remarkable.upload_to_remarkable(solution_path, True)
 
 
 def download_and_upload_gratis_kryssord():
     kryssord_path = gratis_kryssord.download_gratiskryssord("https://www.gratiskryssord.no/kryssord/dagens/")
-    remarkable.upload_to_remarkable(kryssord_path)
+    # remarkable.upload_to_remarkable(kryssord_path)
 
 
 def main():
